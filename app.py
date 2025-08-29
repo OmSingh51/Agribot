@@ -1,208 +1,71 @@
-import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-import sys
-import json
-import faiss
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import os, json
 import numpy as np
 from PIL import Image
 import tensorflow as tf
-from flask import Flask, render_template, request, jsonify
-from langchain_community.vectorstores import FAISS
+import faiss
+from sentence_transformers import SentenceTransformer
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
 from langchain_groq import ChatGroq
 from langchain.chains import ConversationalRetrievalChain
-import io
-import base64
 
+# -------- Config --------
+GROQ_API_KEY = "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"  
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"   # disable GPU
 app = Flask(__name__)
+CORS(app)
 
-# Globals (CNN will be lazy loaded)
-qa_chain, llm, model, labels, embedding_model = None, None, None, None, None
+# -------- Load FAISS --------
+def load_vectorstore(index_path="index.faiss", meta_path="metadata.json"):
+    if not (os.path.exists(index_path) and os.path.exists(meta_path)):
+        return None
+    index=faiss.read_index(index_path)
+    meta=json.load(open(meta_path))
+    docs={k:Document(**v) for k,v in meta["docstore"].items()}
+    return FAISS(HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2"),
+                 index=index, docstore=docs, index_to_docstore_id=meta["index_to_docstore_id"])
 
-# Initialize FAISS + LLM (lightweight stuff only)
-def initialize_components():
-    global qa_chain, llm, embedding_model
+vectordb=load_vectorstore()
+retriever=vectordb.as_retriever(search_kwargs={"k":3}) if vectordb else None
 
-    GROQ_API_KEY = "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"
+# -------- Load LLM --------
+llm=ChatGroq(groq_api_key=GROQ_API_KEY, model="openai/gpt-oss-20b")
+qa_chain=ConversationalRetrievalChain.from_llm(llm,retriever) if retriever else None
 
-    # Initialize embedding model
-    embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# -------- Load CNN --------
+try:
+    model=tf.keras.models.load_model("Plant_Disease_CNN_model.h5")
+    class_map=json.load(open("class_indices.json"))
+    labels={int(v):k for k,v in class_map.items()}
+except Exception as e:
+    print("Model load error:",e)
+    model=None; labels={}
 
-    # Load FAISS vectorstore
-    try:
-        index = faiss.read_index("index.faiss")
-        with open("metadata.json", "r") as f:
-            metadata = json.load(f)
-        docstore = {k: Document(**v) for k, v in metadata["docstore"].items()}
-        vectordb = FAISS(
-            embedding_function=embedding_model,
-            index=index,
-            docstore=docstore,
-            index_to_docstore_id=metadata["index_to_docstore_id"]
-        )
-        retriever = vectordb.as_retriever(search_kwargs={"k": 3})
-        print("FAISS vectorstore loaded successfully")
-    except Exception as e:
-        print(f"Error loading FAISS: {e}")
-        retriever = None
-
-    # Initialize LLM
-    if GROQ_API_KEY:
-        try:
-            llm = ChatGroq(
-                groq_api_key=GROQ_API_KEY,
-                model_name="mixtral-8x7b-32768",
-                temperature=0.1
-            )
-            print("LLM initialized successfully")
-        except Exception as e:
-            print(f"Error initializing LLM: {e}")
-            llm = None
-    else:
-        llm = None
-        print("GROQ_API_KEY not set")
-
-    # Create QA chain
-    if retriever and llm:
-        try:
-            qa_chain = ConversationalRetrievalChain.from_llm(
-                llm=llm,
-                retriever=retriever,
-                return_source_documents=True
-            )
-            print("QA chain created successfully")
-        except Exception as e:
-            print(f"Error creating QA chain: {e}")
-            qa_chain = None
-    else:
-        qa_chain = None
-        print("QA chain not available due to missing components")
-
-# Initialize lightweight components at startup
-initialize_components()
-
-# Chat history
-chat_history = []
-
-# Helper: call LLM directly
-def call_llm_direct(user_msg):
-    if not llm:
-        return "LLM not available. Please check your API key."
-
-    system_prompt = "You are an agronomy assistant. Be concise and helpful about crops, soil, irrigation, pests, and fertilizers."
-
-    history_txt = ""
-    if chat_history:
-        lines = []
-        for u, a in chat_history[-6:]:
-            lines.append(f"User: {u}\nAssistant: {a}")
-        history_txt = "\n\n".join(lines)
-
-    prompt = f"{system_prompt}\n\n"
-    if history_txt:
-        prompt += f"Conversation so far:\n{history_txt}\n\n"
-    prompt += f"User: {user_msg}\nAssistant:"
-
-    try:
-        resp = llm.invoke(prompt)
-        return resp.content if hasattr(resp, "content") else str(resp)
-    except Exception as e:
-        print(f"LLM error: {e}")
-        return "Sorry, I'm currently unable to answer your question."
-
-# Helper: preprocess image
-def preprocess_image(img_file):
-    img = Image.open(io.BytesIO(img_file)).convert("RGB")
-    img = img.resize((128, 128))
-    img_array = np.array(img) / 255.0
-    img_array = np.expand_dims(img_array, axis=0)
-    return img_array
-
-# Routes
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/chat', methods=['POST'])
+# -------- Routes --------
+@app.route("/chat", methods=["POST"])
 def chat():
+    msg=request.json.get("message","")
+    if not msg: return jsonify({"error":"No message"}),400
     try:
-        user_msg = request.json.get('message', '')
-        if not user_msg:
-            return jsonify({'error': 'No message provided'})
-
         if qa_chain:
-            result = qa_chain({"question": user_msg, "chat_history": chat_history})
-            reply = result["answer"]
-        else:
-            reply = call_llm_direct(user_msg)
+            result=qa_chain({"question":msg,"chat_history":[]})
+            return jsonify({"reply":result.get("answer")})
+    except: pass
+    resp=llm.invoke(f"You are an agriculture assistant.\nUser:{msg}\nAssistant:")
+    return jsonify({"reply":getattr(resp,"content",str(resp))})
 
-        chat_history.append((user_msg, reply))
+@app.route("/predict", methods=["POST"])
+def predict():
+    if "image" not in request.files: return jsonify({"error":"No image"}),400
+    if not model: return jsonify({"error":"Model not loaded"}),500
+    img=Image.open(request.files["image"]).convert("RGB").resize((128,128))
+    arr=np.expand_dims(np.array(img)/255.0,0)
+    pred=model.predict(arr)
+    idx=int(np.argmax(pred)); conf=float(np.max(pred))*100
+    return jsonify({"class":labels.get(idx,str(idx)),"confidence":conf})
 
-        return jsonify({
-            'response': reply,
-            'history': chat_history[-10:]
-        })
-    except Exception as e:
-        print(f"Chat error: {e}")
-        return jsonify({'error': str(e)})
-
-@app.route('/detect_disease', methods=['POST'])
-def detect_disease():
-    global model, labels
-    try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file uploaded'})
-
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'No file selected'})
-
-        # Lazy-load CNN model
-        if model is None or labels is None:
-            model = tf.keras.models.load_model("Plant_Disease_CNN_model.h5")
-            with open("class_indices.json", "r") as f:
-                class_indices = json.load(f)
-            labels = {v: k for k, v in class_indices.items()}
-            print("CNN model loaded on demand ✅")
-
-        img_data = file.read()
-        img_array = preprocess_image(img_data)
-        prediction = model.predict(img_array)
-        class_idx = np.argmax(prediction)
-        class_label = labels[class_idx]
-        confidence = float(np.max(prediction)) * 100
-
-        img_base64 = base64.b64encode(img_data).decode('utf-8')
-
-        return jsonify({
-            'disease': class_label,
-            'confidence': confidence,
-            'image': f"data:image/jpeg;base64,{img_base64}"
-        })
-    except Exception as e:
-        print(f"Disease detection error: {e}")
-        return jsonify({'error': str(e)})
-
-@app.route('/get_history', methods=['GET'])
-def get_history():
-    return jsonify({'history': chat_history[-10:]})
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'llm_available': llm is not None,
-        'model_available': model is not None,
-        'qa_chain_available': qa_chain is not None
-    })
-    
-if __name__ == '__main__':
-    # check command line args first
-    port = int(os.environ.get('PORT', 5000))
-    if len(sys.argv) > 1 and sys.argv[1].startswith("--port="):
-        port = int(sys.argv[1].split("=")[1])
-
-    print(f"Flask running on port {port} 🚀")
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
-
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=5000,debug=True)
