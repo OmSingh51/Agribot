@@ -24,7 +24,7 @@ qa_chain, llm, model, labels, embedding_model = None, None, None, None, None
 def initialize_components():
     global qa_chain, llm, embedding_model
 
-    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+    GROQ_API_KEY = "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"
 
     # Initialize embedding model
     embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
