@@ -17,7 +17,7 @@ st.title("🌾 AgriBot — Farm Assistant")
 st.caption("Chat about crops, soil, irrigation & pests • (Image disease detector coming next)")
 
 # Load Groq API Key
-GROQ_API_KEY = "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"
+GROQ_API_KEY = ""
 
 # ------------------ Load FAISS + Metadata ------------------ #
 def load_faiss_vectorstore(embedding_model):
